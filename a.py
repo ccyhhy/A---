@@ -13,6 +13,7 @@ CSV 输入（--data-dir）：
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -28,6 +29,10 @@ class BacktestConfig:
     top_pct: float = 0.10
     min_pb: float = 0.0
     pb_lag_months: int = 1
+    pb_winsorize: bool = False
+    winsor_lower: float = 0.01
+    winsor_upper: float = 0.99
+    pb_zscore: bool = False
 
 
 class DataSource:
@@ -142,6 +147,26 @@ class CSVDataSource(DataSource):
         return series
 
 
+def winsorize_series(series: pd.Series, lower: float, upper: float) -> pd.Series:
+    # 对因子做去极值，降低极端值影响。
+    if series.empty:
+        return series
+    low = series.quantile(lower)
+    high = series.quantile(upper)
+    return series.clip(lower=low, upper=high)
+
+
+def zscore_series(series: pd.Series) -> pd.Series:
+    # 标准化为 z-score，避免量纲影响。
+    if series.empty:
+        return series
+    mean = series.mean()
+    std = series.std(ddof=0)
+    if std == 0 or pd.isna(std):
+        return pd.Series(0.0, index=series.index)
+    return (series - mean) / std
+
+
 class PBValueBacktest:
     def __init__(self, data_source: DataSource, config: BacktestConfig) -> None:
         self.ds = data_source
@@ -199,7 +224,10 @@ class PBValueBacktest:
                 }
             )
 
-            h = px[["pb"]].copy()
+            h_cols = ["pb"]
+            if "factor" in px.columns:
+                h_cols.append("factor")
+            h = px[h_cols].copy()
             h["weight"] = 1.0 / len(px)
             h["select_date"] = select_date
             h["pb_date"] = pb_date
@@ -216,7 +244,7 @@ class PBValueBacktest:
         return res_df, holdings_df
 
     def select_universe(self, select_date: pd.Timestamp, pb_date: pd.Timestamp) -> pd.DataFrame:
-        # 过滤 PB 与 ST 股票，再选取 PB 最小的指定分位（PB 使用滞后月份）。 
+        # 过滤 PB 与 ST 股票，再选取 PB 最小的指定分位（PB 使用滞后月份）。
         pb = self.ds.get_pb(pb_date)
         if pb.empty:
             return pd.DataFrame(columns=["pb"])
@@ -232,8 +260,16 @@ class PBValueBacktest:
         if pb.empty:
             return pd.DataFrame(columns=["pb"])
 
+        factor = pb["pb"].copy()
+        if self.cfg.pb_winsorize:
+            factor = winsorize_series(factor, self.cfg.winsor_lower, self.cfg.winsor_upper)
+        if self.cfg.pb_zscore:
+            factor = zscore_series(factor)
+
+        pb = pb.assign(factor=factor)
+
         n = max(1, int(len(pb) * self.cfg.top_pct))
-        picks = pb.nsmallest(n, "pb")
+        picks = pb.nsmallest(n, "factor")
         return picks
 
 
@@ -276,8 +312,9 @@ def last_trading_day_before_or_in_month(
     return pd.Timestamp(dates.max()).normalize()
 
 
-def performance_stats(returns: pd.Series) -> dict:
+def performance_stats(returns: pd.Series, benchmark_returns: Optional[pd.Series] = None) -> dict:
     # 基于月度收益的统计指标，用于快速汇总。
+    returns = returns.dropna()
     if returns.empty:
         return {}
     ann_ret = (1.0 + returns).prod() ** (12.0 / len(returns)) - 1.0
@@ -288,12 +325,36 @@ def performance_stats(returns: pd.Series) -> dict:
     drawdown = (equity / peak) - 1.0
     max_dd = drawdown.min()
     win_rate = (returns > 0).mean()
+
+    downside = returns[returns < 0]
+    if downside.empty:
+        sortino = np.nan
+    else:
+        downside_vol = np.sqrt((downside ** 2).mean()) * np.sqrt(12.0)
+        sortino = ann_ret / downside_vol if downside_vol != 0 else np.nan
+
+    calmar = ann_ret / abs(max_dd) if max_dd != 0 else np.nan
+
+    beta = np.nan
+    if benchmark_returns is not None and not benchmark_returns.empty:
+        aligned = pd.concat([returns, benchmark_returns], axis=1, join="inner").dropna()
+        if len(aligned) >= 2:
+            cov = np.cov(aligned.iloc[:, 0], aligned.iloc[:, 1], ddof=0)[0, 1]
+            var = np.var(aligned.iloc[:, 1], ddof=0)
+            beta = cov / var if var != 0 else np.nan
+
+    total_return = equity.iloc[-1] - 1.0
+
     return {
         "ann_return": ann_ret,
         "ann_vol": ann_vol,
         "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+        "beta": beta,
         "max_drawdown": max_dd,
         "win_rate": win_rate,
+        "total_return": total_return,
     }
 
 
@@ -356,6 +417,20 @@ def prepare_benchmark_equity(benchmark: pd.DataFrame, dates: pd.Series) -> pd.Se
         return pd.Series(dtype=float)
     base = aligned["close"].iloc[0]
     return aligned["close"] / base
+
+
+def prepare_benchmark_returns(benchmark: pd.DataFrame, dates: pd.Series) -> pd.Series:
+    # 将基准指数对齐到回测日期，并计算对应区间收益。
+    if benchmark.empty:
+        return pd.Series(dtype=float)
+    bench = benchmark.set_index("date").sort_index()
+    aligned = bench.reindex(pd.to_datetime(dates), method="ffill")
+    aligned = aligned.dropna(subset=["close"])
+    if aligned.empty:
+        return pd.Series(dtype=float)
+    returns = aligned["close"].pct_change()
+    returns.index = aligned.index
+    return returns.dropna()
 
 
 def plot_equity_curve(
@@ -644,6 +719,11 @@ def main() -> None:
     parser.add_argument("--plot-out", default="equity_curve.png", help="权益曲线图片输出路径")
     parser.add_argument("--benchmark-csv", default="", help="基准指数 CSV（日期+收盘价）")
     parser.add_argument("--benchmark-name", default="纳斯达克100", help="基准名称")
+    parser.add_argument("--winsorize-pb", action="store_true", help="对 PB 做去极值处理")
+    parser.add_argument("--winsor-lower", type=float, default=0.01, help="去极值下分位")
+    parser.add_argument("--winsor-upper", type=float, default=0.99, help="去极值上分位")
+    parser.add_argument("--zscore-pb", action="store_true", help="对 PB 做标准化")
+    parser.add_argument("--report-out", default="report.json", help="回测报告输出路径")
     parser.add_argument("--use-akshare", action="store_true", help="使用 AkShare 自动下载并生成 CSV")
     parser.add_argument("--download-akshare", action="store_true", help="强制重新下载 AkShare 数据")
     parser.add_argument("--adjust", default="qfq", help="复权方式：qfq/hfq/''")
@@ -665,12 +745,22 @@ def main() -> None:
         top_pct=0.10,
         min_pb=0.0,
         pb_lag_months=args.pb_lag_months,
+        pb_winsorize=args.winsorize_pb,
+        winsor_lower=args.winsor_lower,
+        winsor_upper=args.winsor_upper,
+        pb_zscore=args.zscore_pb,
     )
     ds = CSVDataSource(args.data_dir)
     bt = PBValueBacktest(ds, cfg)
 
     res_df, holdings_df = bt.run()
-    stats = performance_stats(res_df["ret"])
+    benchmark = None
+    benchmark_returns = None
+    if args.benchmark_csv:
+        benchmark = load_benchmark_csv(args.benchmark_csv)
+        benchmark_returns = prepare_benchmark_returns(benchmark, res_df["sell_date"])
+
+    stats = performance_stats(res_df["ret"], benchmark_returns)
 
     res_df.to_csv(args.out, index=False)
     if not holdings_df.empty:
@@ -680,14 +770,30 @@ def main() -> None:
     print(f"年化收益率: {stats.get('ann_return', float('nan')):.4f}")
     print(f"年化波动率: {stats.get('ann_vol', float('nan')):.4f}")
     print(f"夏普比率: {stats.get('sharpe', float('nan')):.4f}")
+    print(f"索提诺比率: {stats.get('sortino', float('nan')):.4f}")
+    print(f"卡玛比率: {stats.get('calmar', float('nan')):.4f}")
     print(f"最大回撤: {stats.get('max_drawdown', float('nan')):.4f}")
     print(f"胜率: {stats.get('win_rate', float('nan')):.4f}")
-    print(f"累计收益: {res_df['equity'].iloc[-1] - 1:.4f}")
+    print(f"累计收益: {stats.get('total_return', float('nan')):.4f}")
+    if args.benchmark_csv:
+        print(f"Beta({args.benchmark_name}): {stats.get('beta', float('nan')):.4f}")
+
+    report = {
+        "periods": len(res_df),
+        "start": args.start,
+        "end": args.end,
+        "pb_lag_months": cfg.pb_lag_months,
+        "winsorize_pb": cfg.pb_winsorize,
+        "winsor_lower": cfg.winsor_lower,
+        "winsor_upper": cfg.winsor_upper,
+        "zscore_pb": cfg.pb_zscore,
+        "benchmark_name": args.benchmark_name if args.benchmark_csv else None,
+        "metrics": stats,
+    }
+    with open(args.report_out, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
 
     if not args.no_plot:
-        benchmark = None
-        if args.benchmark_csv:
-            benchmark = load_benchmark_csv(args.benchmark_csv)
         plot_equity_curve(
             res_df,
             args.plot_out,
