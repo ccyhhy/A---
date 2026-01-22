@@ -1,0 +1,12 @@
+# 忽略巨大的 CSV 数据文件
+data/*.csv
+*.csv
+
+# 忽略回测生成的图片
+*.png
+
+# 忽略日志文件
+*.log
+
+# 忽略 VSCode 个人配置
+.vscode/
