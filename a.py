@@ -75,7 +75,11 @@ class CSVDataSource(DataSource):
             return pd.DataFrame()
         if not path.exists():
             raise FileNotFoundError(f"Missing file: {path}")
-        df = pd.read_csv(path)
+        try:
+            df = pd.read_csv(path)
+        except pd.errors.ParserError:
+            print(f"警告: {path} 存在格式异常行，已自动跳过。建议重新下载以保证完整性。")
+            df = pd.read_csv(path, on_bad_lines="skip", engine="python")
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"])
         if "list_date" in df.columns:
@@ -535,6 +539,15 @@ def plot_equity_curve(
         hover_dot.set_offsets([[x_val, y_val]])
         hover_dot.set_visible(True)
         hover_text.xy = (x_val, y_val)
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        x_offset = 8
+        y_offset = 8
+        if event.xdata is not None and event.xdata > xlim[0] + (xlim[1] - xlim[0]) * 0.75:
+            x_offset = -80
+        if event.ydata is not None and event.ydata > ylim[0] + (ylim[1] - ylim[0]) * 0.8:
+            y_offset = -40
+        hover_text.set_position((x_offset, y_offset))
         ret_val = plot_df.loc[idx, "ret"] if "ret" in plot_df.columns else np.nan
         if pd.notna(ret_val):
             hover_text.set_text(f"{x_display}\n权益: {y_val:.2f}\n当月收益: {ret_val:.2%}")

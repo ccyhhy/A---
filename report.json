@@ -1,0 +1,22 @@
+{
+  "periods": 167,
+  "start": "2012-01-01",
+  "end": "2026-01-22",
+  "pb_lag_months": 1,
+  "winsorize_pb": false,
+  "winsor_lower": 0.01,
+  "winsor_upper": 0.99,
+  "zscore_pb": false,
+  "benchmark_name": null,
+  "metrics": {
+    "ann_return": 0.16258860364669991,
+    "ann_vol": 0.27695932240710847,
+    "sharpe": 0.5870486764395944,
+    "sortino": 0.725943737101802,
+    "calmar": 0.5035471654544375,
+    "beta": NaN,
+    "max_drawdown": -0.322886543309142,
+    "win_rate": 0.572289156626506,
+    "total_return": 7.036380970116221
+  }
+}

@@ -1,8 +1,8 @@
-total=319
-downloaded=246
-empty=73
+total=0
+downloaded=0
+empty=0
 failed=0
-price_rows=57739
-pb_rows=28984
-st_rows=28984
+price_rows=0
+pb_rows=0
+st_rows=0
 listing_rows=5502
